@@ -8,11 +8,13 @@ from dataclasses import dataclass
 import json
 import logging
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 from tqdm import tqdm
 import torch
 import torchaudio
 import torch.nn.functional as F
+import numpy as np
+import librosa
 
 from .utils import load_model
 
@@ -80,17 +82,32 @@ class AesWavlmPredictorMultiOutput:
     checkpoint_pth: str
     precision: str = "bf16"
     batch_size: int = 1
-    data_col: str = "path"
     sample_rate: int = 16000  # const
+    device: str = "cpu"
 
-    def __post_init__(self):
+    def __init__(self, checkpoint_pth, precision="bf16", batch_size=1, device="cpu"):
+        self.checkpoint_pth = checkpoint_pth
+        self.precision = precision
+        self.batch_size = batch_size
+        self.sample_rate = 16000  # const
+        self.device = device
+        self.dtype = {
+            "16": torch.float16,
+            "bf16": torch.bfloat16,
+        }.get(self.precision, torch.float32)
+        if self.dtype == torch.float32:
+            logging.warning(
+                f"Precision {self.precision} is not supported, using float32 instead."
+            )
         self.setup_model()
+
 
     def setup_model(self):
         checkpoint_file = load_model(self.checkpoint_pth)
 
         # This method gets called before inference starts
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device(self.device)
         logging.info(f"Setting up Aesthetic model on {self.device}")
 
         with open(checkpoint_file, "rb") as fin:
@@ -150,11 +167,21 @@ class AesWavlmPredictorMultiOutput:
             wav = wav.mean(dim=0, keepdim=True)
             wavs.append(wav)
         return wavs
+    
+    def audio_resample_mono_versa(self, data_list: List[Tuple[np.array, int]],) -> List:
+        wavs = []
+        for wav, sr in data_list:
+            if wav.ndim == 2:
+                wav = wav.mean(axis=0, keepdims=True)
+            wav = librosa.resample(wav, orig_sr=sr, target_sr=self.sample_rate)
+            wav = torch.from_numpy(wav).unsqueeze(0).float()
+            wavs.append(wav)
+        return wavs
 
-    def forward(self, batch):
+    def forward_versa(self, batch):
         with torch.inference_mode():
             bsz = len(batch)
-            wavs = self.audio_resample_mono(batch)
+            wavs = self.audio_resample_mono_versa(batch)
             wavs, masks, weights, bids = make_inference_batch(
                 wavs,
                 10,
@@ -169,6 +196,7 @@ class AesWavlmPredictorMultiOutput:
             bids = torch.tensor(bids).to(self.device)
 
             assert wavs.shape[0] == masks.shape[0] == weights.shape[0] == bids.shape[0]
+            print(wavs, flush=True)
             preds_all = self.model({"wav": wavs, "mask": masks})
             all_result = {}
             for axis in AXES_NAME:
